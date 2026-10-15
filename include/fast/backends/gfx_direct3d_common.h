@@ -47,6 +47,16 @@ struct FramebufferDX11 {
     uint32_t texture_id;
     bool has_depth_buffer;
     uint32_t msaa_level;
+    bool preserve_alpha = false;
+    bool transparent_capture_cleared = false;
+    bool shared_texture_enabled = false;
+    bool shared_mutex_acquired = false;
+    uint64_t shared_acquired_key = 0;
+    Microsoft::WRL::ComPtr<IDXGIKeyedMutex> shared_keyed_mutex;
+    HANDLE shared_nt_handle = nullptr;
+    HANDLE shared_target_process = nullptr;
+    uint32_t shared_target_process_id = 0;
+    uint64_t shared_remote_handle = 0;
 };
 
 struct ShaderProgramD3D11 {
@@ -54,6 +64,7 @@ struct ShaderProgramD3D11 {
     Microsoft::WRL::ComPtr<ID3D11PixelShader> pixel_shader;
     Microsoft::WRL::ComPtr<ID3D11InputLayout> input_layout;
     Microsoft::WRL::ComPtr<ID3D11BlendState> blend_state;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> transparent_capture_blend_state;
 
     uint64_t shader_id0;
     uint32_t shader_id1;
@@ -96,11 +107,24 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                      bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                      bool can_extract_depth) override;
+    bool PrepareFramebufferForTransparentCapture(int fbId) override;
     void StartDrawToFramebuffer(int fbId, float noiseScale) override;
     void CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1, int dstX0, int dstY0,
                          int dstX1, int dstY1) override;
+    bool CopyFramebufferSameSize(int fbDstId, int fbSrcId) override;
     void ClearFramebuffer(bool color, bool depth) override;
     void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) override;
+    bool ReadFramebufferColorToCPU(int fbId, uint32_t width, uint32_t height, uint8_t* rgba8Buf) override;
+    bool ReadFramebufferDepthToCPU(int fbId, uint32_t width, uint32_t height, float* depthBuf) override;
+    bool SupportsFramebufferSharedTexture() const override {
+        return true;
+    }
+    bool GetFramebufferSharedTextureHandle(int fbId, uint64_t* sourceHandle) override;
+    bool ExportFramebufferSharedTexture(int fbId, uint32_t targetProcessId, uint64_t* remoteHandle) override;
+    bool AbandonFramebufferSharedTextureHandle(int fbId) override;
+    bool AcquireFramebufferSharedTexture(int fbId, uint64_t key) override;
+    bool ReleaseFramebufferSharedTexture(int fbId, uint64_t key) override;
+    void DisableFramebufferSharedTexture(int fbId) override;
     void ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) override;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) override;

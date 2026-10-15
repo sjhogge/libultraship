@@ -3,9 +3,11 @@
 #include <cstdio>
 #include <vector>
 #include <cmath>
+#include <cstring>
 
 #include <map>
 #include <unordered_map>
+#include <utility>
 
 #include <windows.h>
 #include <versionhelpers.h>
@@ -47,7 +49,57 @@ using namespace Microsoft::WRL; // For ComPtr
 
 namespace Fast {
 
+namespace {
+
+void ForgetRemoteFramebufferHandle(FramebufferDX11& framebuffer) {
+    // A duplicated handle is owned by the target process. It may already have
+    // been closed and its numeric slot reused there, so trying to force-close
+    // that value from the producer can destroy an unrelated target handle.
+    // The consumer closes superseded handles; process exit is the final safety
+    // net. The producer only forgets its cached remote value here.
+    framebuffer.shared_remote_handle = 0;
+}
+
+void ResetFramebufferSharedResource(FramebufferDX11& framebuffer, ID3D11DeviceContext* context,
+                                    bool closeTargetProcess) {
+    if (framebuffer.shared_mutex_acquired && framebuffer.shared_keyed_mutex) {
+        // Teardown has no next reader to nominate. Releasing to the acquired
+        // key still relinquishes ownership cleanly before the local resource
+        // is destroyed; the consumer is responsible for retiring its old
+        // handle when it observes the replacement/disable publication.
+        if (context != nullptr) {
+            context->Flush();
+        }
+        const HRESULT result = framebuffer.shared_keyed_mutex->ReleaseSync(framebuffer.shared_acquired_key);
+        if (FAILED(result)) {
+            SPDLOG_DEBUG("Unable to release framebuffer keyed mutex during teardown (HRESULT 0x{:08x})",
+                         static_cast<uint32_t>(result));
+        }
+    }
+    ForgetRemoteFramebufferHandle(framebuffer);
+    framebuffer.shared_mutex_acquired = false;
+    framebuffer.shared_acquired_key = 0;
+    framebuffer.shared_keyed_mutex.Reset();
+    if (framebuffer.shared_nt_handle != nullptr) {
+        CloseHandle(framebuffer.shared_nt_handle);
+        framebuffer.shared_nt_handle = nullptr;
+    }
+    if (closeTargetProcess) {
+        if (framebuffer.shared_target_process != nullptr) {
+            CloseHandle(framebuffer.shared_target_process);
+            framebuffer.shared_target_process = nullptr;
+        }
+        framebuffer.shared_target_process_id = 0;
+    }
+}
+
+} // namespace
+
 GfxRenderingAPIDX11::~GfxRenderingAPIDX11() {
+    for (auto& framebuffer : mFrameBuffers) {
+        ResetFramebufferSharedResource(framebuffer, mContext.Get(), true);
+        framebuffer.shared_texture_enabled = false;
+    }
 }
 
 GfxRenderingAPIDX11::GfxRenderingAPIDX11(GfxWindowBackendDXGI* backend) {
@@ -495,6 +547,17 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
 
     ThrowIfFailed(mDevice->CreateBlendState(&blend_desc, prg->blend_state.GetAddressOf()));
 
+    // Normal libultraship targets begin with alpha 1 and intentionally retain
+    // it. Bridge capture targets begin transparent, so they need source-over
+    // alpha accumulation while keeping the existing RGB blend equation. RGB
+    // over transparent black is consequently premultiplied at readback.
+    if (cc_features.opt_alpha) {
+        blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    }
+    ThrowIfFailed(mDevice->CreateBlendState(
+        &blend_desc, prg->transparent_capture_blend_state.GetAddressOf()));
+
     // Save some values
 
     prg->shader_id0 = shader_id0;
@@ -759,10 +822,17 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mContext->VSSetShader(mShaderProgram->vertex_shader.Get(), 0, 0);
         mContext->PSSetShader(mShaderProgram->pixel_shader.Get(), 0, 0);
 
-        if (mLastBlendState.Get() != mShaderProgram->blend_state.Get()) {
-            mLastBlendState = mShaderProgram->blend_state.Get();
-            mContext->OMSetBlendState(mShaderProgram->blend_state.Get(), 0, 0xFFFFFFFF);
-        }
+    }
+
+    const bool transparentCapture = mCurrentFramebuffer >= 0 &&
+                                    mCurrentFramebuffer < static_cast<int>(mFrameBuffers.size()) &&
+                                    mFrameBuffers[mCurrentFramebuffer].preserve_alpha;
+    auto* blendState = transparentCapture ?
+        mShaderProgram->transparent_capture_blend_state.Get() :
+        mShaderProgram->blend_state.Get();
+    if (mLastBlendState.Get() != blendState) {
+        mLastBlendState = blendState;
+        mContext->OMSetBlendState(blendState, nullptr, 0xFFFFFFFF);
     }
 
     if (mLastPrimitaveTopology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) {
@@ -778,6 +848,13 @@ void GfxRenderingAPIDX11::OnResize() {
 }
 
 void GfxRenderingAPIDX11::StartFrame() {
+    // Interpreter::Run calls StartFrame once for every frame-interpolation
+    // replay. A transparent capture target must therefore be cleared on its
+    // first bind in each replay, not merely when its display list is built.
+    for (auto& framebuffer : mFrameBuffers) {
+        framebuffer.transparent_capture_cleared = false;
+    }
+
     // Set per-frame constant buffer
     ID3D11Buffer* buffers[2] = { mPerFrameCb.Get(), mPerDrawCb.Get() };
     mContext->PSSetConstantBuffers(0, 2, buffers);
@@ -828,10 +905,25 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
         --msaa_level;
     }
 
+    // D3D11 keyed-mutex shared resources must be single-sampled render
+    // targets. If a caller changes either constraint, return this framebuffer
+    // to its ordinary backend-owned form rather than creating an invalid
+    // resource or silently exporting something different from what is drawn.
+    if (fb.shared_texture_enabled && (msaa_level != 1 || !render_target || fb_id == 0)) {
+        ResetFramebufferSharedResource(fb, mContext.Get(), true);
+        fb.shared_texture_enabled = false;
+    }
+
     bool diff = tex.width != width || tex.height != height || fb.msaa_level != msaa_level;
 
     if (diff || (fb.render_target_view.Get() != nullptr) != render_target) {
         if (fb_id != 0) {
+            if (fb.shared_texture_enabled) {
+                // Resize/reconfiguration invalidates both process-local and
+                // duplicated handles. Keep the target process open so a
+                // following export call can publish the replacement cheaply.
+                ResetFramebufferSharedResource(fb, mContext.Get(), false);
+            }
             D3D11_TEXTURE2D_DESC texture_desc;
             texture_desc.Width = width;
             texture_desc.Height = height;
@@ -840,7 +932,10 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
                 (msaa_level <= 1 ? D3D11_BIND_SHADER_RESOURCE : 0) | (render_target ? D3D11_BIND_RENDER_TARGET : 0);
             texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             texture_desc.CPUAccessFlags = 0;
-            texture_desc.MiscFlags = 0;
+            texture_desc.MiscFlags = fb.shared_texture_enabled
+                                         ? D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                                               D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
+                                         : 0;
             texture_desc.ArraySize = 1;
             texture_desc.MipLevels = 1;
             texture_desc.SampleDesc.Count = msaa_level;
@@ -888,6 +983,20 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
     fb.msaa_level = msaa_level;
 }
 
+bool GfxRenderingAPIDX11::PrepareFramebufferForTransparentCapture(int fb_id) {
+    if (fb_id <= 0 || fb_id >= static_cast<int>(mFrameBuffers.size())) {
+        return false;
+    }
+    FramebufferDX11& fb = mFrameBuffers[fb_id];
+    if (!fb.render_target_view || fb.msaa_level != 1) {
+        return false;
+    }
+
+    fb.preserve_alpha = true;
+    fb.transparent_capture_cleared = false;
+    return true;
+}
+
 void GfxRenderingAPIDX11::StartDrawToFramebuffer(int fb_id, float noise_scale) {
     FramebufferDX11& fb = mFrameBuffers[fb_id];
     mRenderTargetHeight = mTextures[fb.texture_id].height;
@@ -896,6 +1005,11 @@ void GfxRenderingAPIDX11::StartDrawToFramebuffer(int fb_id, float noise_scale) {
                                  fb.has_depth_buffer ? fb.depth_stencil_view.Get() : nullptr);
 
     mCurrentFramebuffer = fb_id;
+    if (fb.preserve_alpha && !fb.transparent_capture_cleared) {
+        constexpr float transparentBlack[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        mContext->ClearRenderTargetView(fb.render_target_view.Get(), transparentBlack);
+        fb.transparent_capture_cleared = true;
+    }
 
     if (noise_scale != 0.0f) {
         mPerFrameCbData.noise_scale = 1.0f / noise_scale;
@@ -911,7 +1025,8 @@ void GfxRenderingAPIDX11::StartDrawToFramebuffer(int fb_id, float noise_scale) {
 void GfxRenderingAPIDX11::ClearFramebuffer(bool color, bool depth) {
     FramebufferDX11& fb = mFrameBuffers[mCurrentFramebuffer];
     if (color) {
-        const float clearColor[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        const float clearColor[] = { 0.0f, 0.0f, 0.0f,
+                                     fb.preserve_alpha ? 0.0f : 1.0f };
         mContext->ClearRenderTargetView(fb.render_target_view.Get(), clearColor);
     }
     if (depth && fb.has_depth_buffer) {
@@ -1005,6 +1120,41 @@ void GfxRenderingAPIDX11::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX
     }
 }
 
+bool GfxRenderingAPIDX11::CopyFramebufferSameSize(int fb_dst_id, int fb_src_id) {
+    if (fb_dst_id <= 0 || fb_src_id <= 0 || fb_dst_id == fb_src_id ||
+        fb_dst_id >= static_cast<int>(mFrameBuffers.size()) ||
+        fb_src_id >= static_cast<int>(mFrameBuffers.size())) {
+        return false;
+    }
+    const FramebufferDX11& destination = mFrameBuffers[fb_dst_id];
+    const FramebufferDX11& source = mFrameBuffers[fb_src_id];
+    const auto& destinationTexture = mTextures[destination.texture_id].texture;
+    const auto& sourceTexture = mTextures[source.texture_id].texture;
+    if (!destinationTexture || !sourceTexture || destinationTexture.Get() == sourceTexture.Get() ||
+        (destination.shared_texture_enabled && !destination.shared_mutex_acquired) ||
+        (source.shared_texture_enabled && !source.shared_mutex_acquired)) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC destinationDesc{}, sourceDesc{};
+    destinationTexture->GetDesc(&destinationDesc);
+    sourceTexture->GetDesc(&sourceDesc);
+    if (destinationDesc.Width == 0 || destinationDesc.Height == 0 ||
+        destinationDesc.Width != sourceDesc.Width || destinationDesc.Height != sourceDesc.Height ||
+        destinationDesc.Format != DXGI_FORMAT_R8G8B8A8_UNORM || destinationDesc.Format != sourceDesc.Format ||
+        destinationDesc.ArraySize != 1 || sourceDesc.ArraySize != 1 ||
+        destinationDesc.MipLevels != 1 || sourceDesc.MipLevels != 1 ||
+        destinationDesc.SampleDesc.Count != 1 || sourceDesc.SampleDesc.Count != 1 ||
+        destinationDesc.SampleDesc.Quality != sourceDesc.SampleDesc.Quality ||
+        destinationDesc.Usage != D3D11_USAGE_DEFAULT || sourceDesc.Usage != D3D11_USAGE_DEFAULT) {
+        return false;
+    }
+    // Copy all RGBA bytes, including the premultiplied color and coverage
+    // alpha, without consulting the currently restored window viewport.
+    mContext->CopyResource(destinationTexture.Get(), sourceTexture.Get());
+    return SUCCEEDED(mDevice->GetDeviceRemovedReason());
+}
+
 void GfxRenderingAPIDX11::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_t height, uint16_t* rgba16_buf) {
     if (fb_id >= (int)mFrameBuffers.size()) {
         return;
@@ -1042,11 +1192,15 @@ void GfxRenderingAPIDX11::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32
         return;
     }
 
-    // Copy the mapped values to a temp array that we can process later
-    uint32_t* temp = new uint32_t[width * height]();
+    // The mapped texture can have padding at the end of each row. Keep the
+    // source RowPitch, but pack the destination rows tightly for the conversion
+    // below. Using RowPitch on both sides can overrun width * height whenever
+    // the driver chooses a padded pitch.
+    std::vector<uint32_t> temp(width * height);
+    const size_t rowBytes = static_cast<size_t>(width) * sizeof(uint32_t);
     for (size_t i = 0; i < height; i++) {
-        memcpy((uint8_t*)temp + (resource.RowPitch * i), (uint8_t*)resource.pData + (resource.RowPitch * i),
-               resource.RowPitch);
+        memcpy(reinterpret_cast<uint8_t*>(temp.data()) + (rowBytes * i),
+               static_cast<const uint8_t*>(resource.pData) + (resource.RowPitch * i), rowBytes);
     }
 
     mContext->Unmap(staging, 0);
@@ -1068,7 +1222,434 @@ void GfxRenderingAPIDX11::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32
     staging->Release();
     staging = nullptr;
 
-    delete[] temp;
+}
+
+bool GfxRenderingAPIDX11::ReadFramebufferColorToCPU(int fb_id, uint32_t width, uint32_t height,
+                                                    uint8_t* rgba8_buf) {
+    if (rgba8_buf == nullptr || fb_id < 0 || fb_id >= static_cast<int>(mFrameBuffers.size()) || width == 0 ||
+        height == 0) {
+        return false;
+    }
+
+    FramebufferDX11& fb = mFrameBuffers[fb_id];
+    TextureData& texture = mTextures[fb.texture_id];
+    if (!texture.texture || texture.width != width || texture.height != height || fb.msaa_level != 1) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC stagingDesc{};
+    stagingDesc.Width = width;
+    stagingDesc.Height = height;
+    stagingDesc.MipLevels = 1;
+    stagingDesc.ArraySize = 1;
+    stagingDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    stagingDesc.SampleDesc.Count = 1;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(mDevice->CreateTexture2D(&stagingDesc, nullptr, staging.GetAddressOf()))) {
+        return false;
+    }
+    mContext->CopyResource(staging.Get(), texture.texture.Get());
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(mContext->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)) || mapped.pData == nullptr) {
+        return false;
+    }
+
+    const auto rowBytes = static_cast<size_t>(width) * 4U;
+    for (size_t row = 0; row < height; ++row) {
+        std::memcpy(rgba8_buf + row * rowBytes,
+                    static_cast<const uint8_t*>(mapped.pData) + row * mapped.RowPitch, rowBytes);
+    }
+    mContext->Unmap(staging.Get(), 0);
+    return true;
+}
+
+bool GfxRenderingAPIDX11::ReadFramebufferDepthToCPU(int fb_id, uint32_t width, uint32_t height, float* depth_buf) {
+    if (depth_buf == nullptr || fb_id < 0 || fb_id >= static_cast<int>(mFrameBuffers.size()) || width == 0 ||
+        height == 0) {
+        return false;
+    }
+
+    FramebufferDX11& fb = mFrameBuffers[fb_id];
+    if (!fb.has_depth_buffer || !fb.depth_stencil_srv || fb.msaa_level != 1) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Resource> resource;
+    fb.depth_stencil_srv->GetResource(resource.GetAddressOf());
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> source;
+    if (!resource || FAILED(resource.As(&source)) || !source) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    source->GetDesc(&desc);
+    // The D3D11 path creates extractable depth as R32_TYPELESS with a D32 DSV
+    // and R32_FLOAT SRV. R24G8 (feature level 9.x) needs explicit unpacking and
+    // remains an intentionally unsupported fallback.
+    if (desc.Width != width || desc.Height != height || desc.ArraySize != 1 || desc.MipLevels != 1 ||
+        desc.SampleDesc.Count != 1 || desc.Format != DXGI_FORMAT_R32_TYPELESS) {
+        return false;
+    }
+
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(mDevice->CreateTexture2D(&desc, nullptr, staging.GetAddressOf()))) {
+        return false;
+    }
+
+    mContext->CopyResource(staging.Get(), source.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(mContext->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)) || mapped.pData == nullptr) {
+        return false;
+    }
+
+    const size_t row_bytes = static_cast<size_t>(width) * sizeof(float);
+    for (size_t row = 0; row < height; ++row) {
+        memcpy(depth_buf + row * width, static_cast<const uint8_t*>(mapped.pData) + mapped.RowPitch * row, row_bytes);
+    }
+    mContext->Unmap(staging.Get(), 0);
+    return true;
+}
+
+bool GfxRenderingAPIDX11::GetFramebufferSharedTextureHandle(int fb_id, uint64_t* source_handle) {
+    if (source_handle != nullptr) {
+        *source_handle = 0;
+    }
+    if (source_handle == nullptr || fb_id <= 0 ||
+        fb_id >= static_cast<int>(mFrameBuffers.size())) {
+        return false;
+    }
+
+    FramebufferDX11& framebuffer = mFrameBuffers[fb_id];
+    TextureData& texture = mTextures[framebuffer.texture_id];
+    if (!texture.texture || !framebuffer.render_target_view || framebuffer.msaa_level != 1) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    texture.texture->GetDesc(&desc);
+    constexpr UINT requiredFlags =
+        D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+    if (desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM || desc.SampleDesc.Count != 1 || desc.ArraySize != 1 ||
+        desc.MipLevels != 1 || desc.Usage != D3D11_USAGE_DEFAULT ||
+        (desc.BindFlags & D3D11_BIND_RENDER_TARGET) == 0) {
+        return false;
+    }
+
+    if ((desc.MiscFlags & requiredFlags) != requiredFlags) {
+        // Sharing flags are immutable, so promote the existing offscreen
+        // framebuffer by replacing only its color resource. The depth target,
+        // transparent-capture state, dimensions, and RGBA8 format are retained.
+        desc.MiscFlags |= requiredFlags;
+
+        ComPtr<ID3D11Texture2D> sharedTexture;
+        HRESULT result = mDevice->CreateTexture2D(&desc, nullptr, sharedTexture.GetAddressOf());
+        if (FAILED(result)) {
+            SPDLOG_WARN("Failed to create shareable framebuffer {} (HRESULT 0x{:08x})", fb_id,
+                        static_cast<uint32_t>(result));
+            return false;
+        }
+
+        ComPtr<ID3D11RenderTargetView> renderTargetView;
+        result = mDevice->CreateRenderTargetView(sharedTexture.Get(), nullptr, renderTargetView.GetAddressOf());
+        if (FAILED(result)) {
+            return false;
+        }
+
+        ComPtr<ID3D11ShaderResourceView> resourceView;
+        if ((desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0) {
+            result = mDevice->CreateShaderResourceView(sharedTexture.Get(), nullptr, resourceView.GetAddressOf());
+            if (FAILED(result)) {
+                return false;
+            }
+        }
+
+        ComPtr<IDXGIKeyedMutex> keyedMutex;
+        result = sharedTexture.As(&keyedMutex);
+        if (FAILED(result)) {
+            return false;
+        }
+
+        ComPtr<IDXGIResource1> sharedResource;
+        result = sharedTexture.As(&sharedResource);
+        if (FAILED(result)) {
+            return false;
+        }
+
+        HANDLE sharedHandle = nullptr;
+        result = sharedResource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                                                    nullptr, &sharedHandle);
+        if (FAILED(result) || sharedHandle == nullptr) {
+            return false;
+        }
+
+        ResetFramebufferSharedResource(framebuffer, mContext.Get(), false);
+        texture.texture = std::move(sharedTexture);
+        texture.resource_view = std::move(resourceView);
+        framebuffer.render_target_view = std::move(renderTargetView);
+        framebuffer.shared_keyed_mutex = std::move(keyedMutex);
+        framebuffer.shared_nt_handle = sharedHandle;
+        framebuffer.shared_texture_enabled = true;
+    } else {
+        framebuffer.shared_texture_enabled = true;
+        if (!framebuffer.shared_keyed_mutex) {
+            if (FAILED(texture.texture.As(&framebuffer.shared_keyed_mutex))) {
+                DisableFramebufferSharedTexture(fb_id);
+                return false;
+            }
+        }
+        if (framebuffer.shared_nt_handle == nullptr) {
+            ComPtr<IDXGIResource1> sharedResource;
+            if (FAILED(texture.texture.As(&sharedResource))) {
+                DisableFramebufferSharedTexture(fb_id);
+                return false;
+            }
+            HRESULT result = sharedResource->CreateSharedHandle(
+                nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
+                &framebuffer.shared_nt_handle);
+            if (FAILED(result) || framebuffer.shared_nt_handle == nullptr) {
+                framebuffer.shared_nt_handle = nullptr;
+                DisableFramebufferSharedTexture(fb_id);
+                return false;
+            }
+        }
+    }
+
+    // Export the producer's own handle. A more privileged host can duplicate
+    // this into itself even when the producer cannot open that host process.
+    *source_handle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(framebuffer.shared_nt_handle));
+    return *source_handle != 0;
+}
+
+bool GfxRenderingAPIDX11::ExportFramebufferSharedTexture(int fb_id, uint32_t target_process_id,
+                                                         uint64_t* remote_handle) {
+    if (remote_handle != nullptr) {
+        *remote_handle = 0;
+    }
+    if (remote_handle == nullptr || target_process_id == 0 || fb_id <= 0 ||
+        fb_id >= static_cast<int>(mFrameBuffers.size())) {
+        return false;
+    }
+    FramebufferDX11& framebuffer = mFrameBuffers[fb_id];
+    if (framebuffer.shared_texture_enabled && framebuffer.shared_target_process_id != 0 &&
+        framebuffer.shared_target_process_id != target_process_id) {
+        // Retire the old resource before another session can share its mutex.
+        DisableFramebufferSharedTexture(fb_id);
+        if (framebuffer.shared_texture_enabled) {
+            return false;
+        }
+    }
+    uint64_t sourceHandle{};
+    if (!GetFramebufferSharedTextureHandle(fb_id, &sourceHandle)) {
+        return false;
+    }
+
+    if (framebuffer.shared_target_process_id == target_process_id &&
+        framebuffer.shared_target_process != nullptr && framebuffer.shared_remote_handle != 0) {
+        *remote_handle = framebuffer.shared_remote_handle;
+        return true;
+    }
+
+    HANDLE targetProcess = nullptr;
+    bool openedTargetProcess = false;
+    if (framebuffer.shared_target_process_id == target_process_id &&
+        framebuffer.shared_target_process != nullptr) {
+        targetProcess = framebuffer.shared_target_process;
+    } else {
+        targetProcess = OpenProcess(PROCESS_DUP_HANDLE, FALSE, target_process_id);
+        openedTargetProcess = true;
+    }
+    if (targetProcess == nullptr) {
+        SPDLOG_DEBUG("Unable to open shared-framebuffer target process {} (Win32 error {})", target_process_id,
+                     GetLastError());
+        DisableFramebufferSharedTexture(fb_id);
+        return false;
+    }
+
+    HANDLE duplicatedHandle = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), framebuffer.shared_nt_handle, targetProcess, &duplicatedHandle, 0, FALSE,
+                         DUPLICATE_SAME_ACCESS)) {
+        if (openedTargetProcess) {
+            CloseHandle(targetProcess);
+        }
+        SPDLOG_DEBUG("Unable to duplicate framebuffer handle into process {} (Win32 error {})", target_process_id,
+                     GetLastError());
+        DisableFramebufferSharedTexture(fb_id);
+        return false;
+    }
+
+    if (openedTargetProcess) {
+        ForgetRemoteFramebufferHandle(framebuffer);
+        if (framebuffer.shared_target_process != nullptr) {
+            CloseHandle(framebuffer.shared_target_process);
+        }
+        framebuffer.shared_target_process = targetProcess;
+        framebuffer.shared_target_process_id = target_process_id;
+    }
+    framebuffer.shared_remote_handle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(duplicatedHandle));
+    *remote_handle = framebuffer.shared_remote_handle;
+    return true;
+}
+
+bool GfxRenderingAPIDX11::AbandonFramebufferSharedTextureHandle(int fb_id) {
+    if (fb_id <= 0 || fb_id >= static_cast<int>(mFrameBuffers.size())) {
+        return false;
+    }
+
+    FramebufferDX11& framebuffer = mFrameBuffers[fb_id];
+    if (framebuffer.shared_remote_handle == 0) {
+        return true;
+    }
+    if (framebuffer.shared_target_process == nullptr || framebuffer.shared_target_process_id == 0) {
+        return false;
+    }
+
+    // The caller guarantees this duplicate was never disclosed to the target,
+    // so its numeric value cannot have been closed and reused there. Duplicate
+    // it back while atomically closing the source, then close the local copy.
+    HANDLE localHandle = nullptr;
+    const HANDLE remoteHandle = reinterpret_cast<HANDLE>(
+        static_cast<uintptr_t>(framebuffer.shared_remote_handle));
+    const BOOL recovered = DuplicateHandle(framebuffer.shared_target_process, remoteHandle, GetCurrentProcess(),
+                                           &localHandle, 0, FALSE,
+                                           DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE);
+    const DWORD recoveryError = recovered ? ERROR_SUCCESS : GetLastError();
+    framebuffer.shared_remote_handle = 0;
+    if (localHandle != nullptr) {
+        CloseHandle(localHandle);
+    }
+    if (!recovered) {
+        SPDLOG_DEBUG("Unable to close unpublished framebuffer handle in process {} (Win32 error {})",
+                     framebuffer.shared_target_process_id, recoveryError);
+    }
+    return recovered != FALSE;
+}
+
+bool GfxRenderingAPIDX11::AcquireFramebufferSharedTexture(int fb_id, uint64_t key) {
+    if (fb_id <= 0 || fb_id >= static_cast<int>(mFrameBuffers.size())) {
+        return false;
+    }
+    FramebufferDX11& framebuffer = mFrameBuffers[fb_id];
+    if (!framebuffer.shared_texture_enabled || !framebuffer.shared_keyed_mutex ||
+        framebuffer.shared_mutex_acquired) {
+        return false;
+    }
+
+    // Never let the peer stall SoH's render thread. A busy consumer simply
+    // causes this capture frame to be skipped and the host reuses its last one.
+    if (framebuffer.shared_keyed_mutex->AcquireSync(key, 0) != S_OK) {
+        return false;
+    }
+    framebuffer.shared_mutex_acquired = true;
+    framebuffer.shared_acquired_key = key;
+    return true;
+}
+
+bool GfxRenderingAPIDX11::ReleaseFramebufferSharedTexture(int fb_id, uint64_t key) {
+    if (fb_id <= 0 || fb_id >= static_cast<int>(mFrameBuffers.size())) {
+        return false;
+    }
+    FramebufferDX11& framebuffer = mFrameBuffers[fb_id];
+    if (!framebuffer.shared_texture_enabled || !framebuffer.shared_keyed_mutex ||
+        !framebuffer.shared_mutex_acquired) {
+        return false;
+    }
+
+    // D3D11 may defer commands. Submit the completed draw before making the
+    // next keyed-mutex value visible to the other device; Flush does not wait
+    // for GPU completion and therefore remains bounded.
+    mContext->Flush();
+    if (FAILED(framebuffer.shared_keyed_mutex->ReleaseSync(key))) {
+        return false;
+    }
+    framebuffer.shared_mutex_acquired = false;
+    framebuffer.shared_acquired_key = 0;
+    return true;
+}
+
+void GfxRenderingAPIDX11::DisableFramebufferSharedTexture(int fb_id) {
+    if (fb_id <= 0 || fb_id >= static_cast<int>(mFrameBuffers.size())) {
+        return;
+    }
+    FramebufferDX11& framebuffer = mFrameBuffers[fb_id];
+    TextureData& texture = mTextures[framebuffer.texture_id];
+    const auto failClosed = [&](const char* stage, HRESULT result) {
+        SPDLOG_WARN("Failed to {} while disabling framebuffer sharing for {} (HRESULT 0x{:08x}); "
+                    "dropping the color target until it is recreated",
+                    stage, fb_id, static_cast<uint32_t>(result));
+        if (mCurrentFramebuffer == fb_id) {
+            mContext->OMSetRenderTargets(0, nullptr, nullptr);
+        }
+        ResetFramebufferSharedResource(framebuffer, mContext.Get(), true);
+        framebuffer.render_target_view.Reset();
+        texture.resource_view.Reset();
+        texture.texture.Reset();
+        texture.width = 0;
+        texture.height = 0;
+        framebuffer.shared_texture_enabled = false;
+    };
+
+    // MiscFlags are immutable. Recreate an ordinary RGBA8 resource so CPU
+    // fallback and later rendering never touch a keyed-mutex texture without
+    // owning its mutex.
+    if (texture.texture) {
+        D3D11_TEXTURE2D_DESC desc{};
+        texture.texture->GetDesc(&desc);
+        constexpr UINT sharedFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                                     D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+        if ((desc.MiscFlags & sharedFlags) != 0) {
+            desc.MiscFlags &= ~sharedFlags;
+
+            ComPtr<ID3D11Texture2D> ordinaryTexture;
+            HRESULT result = mDevice->CreateTexture2D(&desc, nullptr, ordinaryTexture.GetAddressOf());
+            if (FAILED(result)) {
+                failClosed("create an ordinary color texture", result);
+                return;
+            }
+
+            ComPtr<ID3D11RenderTargetView> renderTargetView;
+            if ((desc.BindFlags & D3D11_BIND_RENDER_TARGET) != 0) {
+                result = mDevice->CreateRenderTargetView(ordinaryTexture.Get(), nullptr,
+                                                         renderTargetView.GetAddressOf());
+                if (FAILED(result)) {
+                    failClosed("create an ordinary render-target view", result);
+                    return;
+                }
+            }
+
+            ComPtr<ID3D11ShaderResourceView> resourceView;
+            if ((desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0) {
+                result = mDevice->CreateShaderResourceView(ordinaryTexture.Get(), nullptr,
+                                                           resourceView.GetAddressOf());
+                if (FAILED(result)) {
+                    failClosed("create an ordinary shader-resource view", result);
+                    return;
+                }
+            }
+
+            ResetFramebufferSharedResource(framebuffer, mContext.Get(), true);
+            texture.texture = std::move(ordinaryTexture);
+            texture.resource_view = std::move(resourceView);
+            framebuffer.render_target_view = std::move(renderTargetView);
+            if (mCurrentFramebuffer == fb_id) {
+                mContext->OMSetRenderTargets(1, framebuffer.render_target_view.GetAddressOf(),
+                                             framebuffer.has_depth_buffer ? framebuffer.depth_stencil_view.Get()
+                                                                          : nullptr);
+            }
+            framebuffer.shared_texture_enabled = false;
+            return;
+        }
+    }
+
+    ResetFramebufferSharedResource(framebuffer, mContext.Get(), true);
+    framebuffer.shared_texture_enabled = false;
 }
 
 void GfxRenderingAPIDX11::SetTextureFilter(FilteringMode mode) {

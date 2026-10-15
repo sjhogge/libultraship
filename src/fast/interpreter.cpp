@@ -1203,7 +1203,25 @@ void Interpreter::GfxSpPopMatrix(uint32_t count) {
 
 float Interpreter::AdjXForAspectRatio(float x) const {
     if (mFbActive) {
-        return x;
+        // Custom framebuffers normally use the game's native projection. If a
+        // fixed-output capture target has a different aspect ratio, apply the
+        // same horizontal correction used by the main viewport instead of
+        // stretching 4:3 geometry across it. Other offscreen targets (such as
+        // the pause-menu Link preview) retain their established projection.
+        if (mActiveFrameBuffer == mFrameBuffers.end() ||
+            !mActiveFrameBuffer->second.fixed_size ||
+            mActiveFrameBuffer->second.native_height == 0 ||
+            mActiveFrameBuffer->second.orig_height == 0 ||
+            mActiveFrameBuffer->second.orig_width == 0 ||
+            mActiveFrameBuffer->second.applied_height == 0 ||
+            mActiveFrameBuffer->second.applied_width == 0) {
+            return x;
+        }
+        const float nativeAspect = static_cast<float>(mActiveFrameBuffer->second.native_width) /
+                                   static_cast<float>(mActiveFrameBuffer->second.native_height);
+        const float targetAspect = static_cast<float>(mActiveFrameBuffer->second.applied_width) /
+                                   static_cast<float>(mActiveFrameBuffer->second.applied_height);
+        return x * nativeAspect / targetAspect;
     } else {
         return x * (4.0f / 3.0f) / ((float)mCurDimensions.width / (float)mCurDimensions.height);
     }
@@ -1878,7 +1896,8 @@ void Interpreter::AdjustVIewportOrScissor(XYWidthHeight* area) {
     } else {
         area->y = mActiveFrameBuffer->second.orig_height - area->y;
 
-        if (mActiveFrameBuffer->second.resize) {
+        if (mActiveFrameBuffer->second.applied_width != mActiveFrameBuffer->second.orig_width ||
+            mActiveFrameBuffer->second.applied_height != mActiveFrameBuffer->second.orig_height) {
             area->width *= RATIO_X(mActiveFrameBuffer, mCurDimensions);
             area->height *= RATIO_Y(mActiveFrameBuffer, mCurDimensions);
             area->x *= RATIO_X(mActiveFrameBuffer, mCurDimensions);
@@ -4332,6 +4351,9 @@ void Interpreter::StartFrame() {
         mNativeDimensions.height != mPrevNativeDimensions.height) {
 
         for (auto& fb : mFrameBuffers) {
+            if (fb.second.fixed_size) {
+                continue;
+            }
             uint32_t width = fb.second.orig_width, height = fb.second.orig_height;
             if (fb.second.resize) {
                 AdjustWidthHeightForScale(width, height, fb.second.native_width, fb.second.native_height);
@@ -4509,14 +4531,52 @@ int Interpreter::CreateFrameBuffer(uint32_t width, uint32_t height, uint32_t nat
     mRapi->UpdateFramebufferParameters(fb, width, height, 1, true, true, true, true);
 
     mFrameBuffers[fb] = {
-        orig_width, orig_height, width, height, native_width, native_height, static_cast<bool>(resize)
+        orig_width, orig_height, width, height, native_width, native_height, static_cast<bool>(resize), false
     };
     return fb;
+}
+
+bool Interpreter::ResizeFrameBuffer(int fbId, uint32_t width, uint32_t height) {
+    auto framebuffer = mFrameBuffers.find(fbId);
+    if (framebuffer == mFrameBuffers.end() || fbId == 0 || width == 0 || height == 0) {
+        return false;
+    }
+
+    mRapi->UpdateFramebufferParameters(fbId, width, height, 1, true, true, true, true);
+    framebuffer->second.applied_width = width;
+    framebuffer->second.applied_height = height;
+    // An explicit output size is independent of the SoH window. Preserve the
+    // logical N64 coordinate space and scale it to this fixed physical target.
+    framebuffer->second.resize = false;
+    framebuffer->second.fixed_size = true;
+    return true;
+}
+
+bool Interpreter::PrepareFrameBufferForTransparentCapture(int fbId) {
+    if (fbId == 0 || mFrameBuffers.find(fbId) == mFrameBuffers.end()) {
+        return false;
+    }
+    return mRapi->PrepareFramebufferForTransparentCapture(fbId);
 }
 
 void Interpreter::SetFrameBuffer(int fb, float noiseScale) {
     mRapi->StartDrawToFramebuffer(fb, noiseScale);
     mRapi->ClearFramebuffer(false, true);
+}
+
+bool Interpreter::CopyFrameBufferSameSize(int fbDstId, int fbSrcId) {
+    const auto destination = mFrameBuffers.find(fbDstId);
+    const auto source = mFrameBuffers.find(fbSrcId);
+    if (fbDstId <= 0 || fbSrcId <= 0 || fbDstId == fbSrcId ||
+        destination == mFrameBuffers.end() || source == mFrameBuffers.end() ||
+        destination->second.applied_width != source->second.applied_width ||
+        destination->second.applied_height != source->second.applied_height) {
+        return false;
+    }
+    // Submit any buffered triangles before copying the completed capture.
+    // The backend additionally validates the actual resource descriptors.
+    Flush();
+    return mRapi->CopyFramebufferSameSize(fbDstId, fbSrcId);
 }
 
 void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, bool* hasCopiedPtr) {
@@ -4752,6 +4812,87 @@ void gfx_cc_get_features(uint64_t shader_id0, uint32_t shader_id1, struct CCFeat
 extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,
                                       uint8_t resize) {
     return Fast::mInstance.lock().get()->CreateFrameBuffer(width, height, native_width, native_height, resize);
+}
+
+extern "C" uint8_t gfx_resize_framebuffer(int framebuffer, uint32_t width, uint32_t height) {
+    const auto instance = Fast::mInstance.lock();
+    return instance && instance->ResizeFrameBuffer(framebuffer, width, height) ? 1 : 0;
+}
+
+extern "C" uint8_t gfx_prepare_framebuffer_for_transparent_capture(int framebuffer) {
+    const auto instance = Fast::mInstance.lock();
+    return instance && instance->PrepareFrameBufferForTransparentCapture(framebuffer) ? 1 : 0;
+}
+
+extern "C" uint8_t gfx_copy_framebuffer_same_size(int destination, int source) {
+    const auto instance = Fast::mInstance.lock();
+    return instance && instance->CopyFrameBufferSameSize(destination, source) ? 1 : 0;
+}
+
+extern "C" uint8_t gfx_read_framebuffer_rgba8(int framebuffer, uint32_t width, uint32_t height,
+                                               uint8_t* rgba8_buffer) {
+    const auto instance = Fast::mInstance.lock();
+    return instance && instance->GetCurrentRenderingAPI()->ReadFramebufferColorToCPU(
+                           framebuffer, width, height, rgba8_buffer)
+               ? 1
+               : 0;
+}
+
+extern "C" uint8_t gfx_read_framebuffer_depth(int framebuffer, uint32_t width, uint32_t height, float* depth_buffer) {
+    const auto instance = Fast::mInstance.lock();
+    return instance && instance->GetCurrentRenderingAPI()->ReadFramebufferDepthToCPU(framebuffer, width, height,
+                           depth_buffer)
+               ? 1
+               : 0;
+}
+
+extern "C" uint8_t gfx_framebuffer_shared_texture_supported(void) {
+    const auto instance = Fast::mInstance.lock();
+    return instance && instance->GetCurrentRenderingAPI()->SupportsFramebufferSharedTexture() ? 1 : 0;
+}
+
+extern "C" uint8_t gfx_get_framebuffer_shared_texture_handle(int framebuffer, uint64_t* source_handle) {
+    if (source_handle != nullptr) {
+        *source_handle = 0;
+    }
+    const auto instance = Fast::mInstance.lock();
+    return instance && instance->GetCurrentRenderingAPI()->GetFramebufferSharedTextureHandle(
+                           framebuffer, source_handle) ? 1 : 0;
+}
+
+extern "C" uint8_t gfx_export_framebuffer_shared_texture(int framebuffer, uint32_t target_process_id,
+                                                          uint64_t* remote_handle) {
+    if (remote_handle != nullptr) {
+        *remote_handle = 0;
+    }
+    const auto instance = Fast::mInstance.lock();
+    return instance && instance->GetCurrentRenderingAPI()->ExportFramebufferSharedTexture(
+                           framebuffer, target_process_id, remote_handle)
+               ? 1
+               : 0;
+}
+
+extern "C" uint8_t gfx_abandon_framebuffer_shared_texture_handle(int framebuffer) {
+    const auto instance = Fast::mInstance.lock();
+    return instance && instance->GetCurrentRenderingAPI()->AbandonFramebufferSharedTextureHandle(framebuffer) ? 1
+                                                                                                               : 0;
+}
+
+extern "C" uint8_t gfx_acquire_framebuffer_shared_texture(int framebuffer, uint64_t key) {
+    const auto instance = Fast::mInstance.lock();
+    return instance && instance->GetCurrentRenderingAPI()->AcquireFramebufferSharedTexture(framebuffer, key) ? 1 : 0;
+}
+
+extern "C" uint8_t gfx_release_framebuffer_shared_texture(int framebuffer, uint64_t key) {
+    const auto instance = Fast::mInstance.lock();
+    return instance && instance->GetCurrentRenderingAPI()->ReleaseFramebufferSharedTexture(framebuffer, key) ? 1 : 0;
+}
+
+extern "C" void gfx_disable_framebuffer_shared_texture(int framebuffer) {
+    const auto instance = Fast::mInstance.lock();
+    if (instance) {
+        instance->GetCurrentRenderingAPI()->DisableFramebufferSharedTexture(framebuffer);
+    }
 }
 
 extern "C" void gfx_texture_cache_clear() {

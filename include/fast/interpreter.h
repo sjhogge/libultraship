@@ -341,10 +341,11 @@ struct RenderingState {
 };
 
 struct FBInfo {
-    uint32_t orig_width, orig_height;       // Original shape
-    uint32_t applied_width, applied_height; // Up-scaled for the viewport
+    uint32_t orig_width, orig_height;       // Logical command-space shape
+    uint32_t applied_width, applied_height; // Physical render-target shape
     uint32_t native_width, native_height;   // Max "native" size of the screen, used for up-scaling
     bool resize;                            // Scale to match the viewport
+    bool fixed_size;                        // Keep an explicitly requested physical output size
 };
 
 struct MaskedTextureEntry {
@@ -374,8 +375,11 @@ class Interpreter {
     void SetMaxFrameLatency(int latency);
     int CreateFrameBuffer(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,
                           uint8_t resize);
+    bool ResizeFrameBuffer(int fbId, uint32_t width, uint32_t height);
+    bool PrepareFrameBufferForTransparentCapture(int fbId);
     void SetFrameBuffer(int fb, float noiseScale);
     void CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, bool* hasCopiedPtr);
+    bool CopyFrameBufferSameSize(int fbDstId, int fbSrcId);
     void ResetFrameBuffer();
     void AdjustPixelDepthCoordinates(float& x, float& y);
     void GetPixelDepthPrepare(float x, float y);
@@ -529,3 +533,24 @@ const char* GfxGetOpcodeName(int8_t opcode);
 extern "C" void gfx_texture_cache_clear();
 extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,
                                       uint8_t resize);
+extern "C" uint8_t gfx_resize_framebuffer(int framebuffer, uint32_t width, uint32_t height);
+extern "C" uint8_t gfx_prepare_framebuffer_for_transparent_capture(int framebuffer);
+extern "C" uint8_t gfx_copy_framebuffer_same_size(int destination, int source);
+extern "C" uint8_t gfx_read_framebuffer_rgba8(int framebuffer, uint32_t width, uint32_t height,
+                                               uint8_t* rgba8_buffer);
+extern "C" uint8_t gfx_read_framebuffer_depth(int framebuffer, uint32_t width, uint32_t height, float* depth_buffer);
+extern "C" uint8_t gfx_framebuffer_shared_texture_supported(void);
+// Returns a stable producer-owned NT handle. The consumer must duplicate it
+// from this process into its own process before opening the shared resource.
+extern "C" uint8_t gfx_get_framebuffer_shared_texture_handle(int framebuffer, uint64_t* source_handle);
+// Exports an NT handle already duplicated into target_process_id. The target
+// owns that duplicated handle and closes it when superseded or disconnected.
+extern "C" uint8_t gfx_export_framebuffer_shared_texture(int framebuffer, uint32_t target_process_id,
+                                                          uint64_t* remote_handle);
+// This is valid only for a duplicate that has never been published to the
+// target process. Published handles remain consumer-owned.
+extern "C" uint8_t gfx_abandon_framebuffer_shared_texture_handle(int framebuffer);
+// Acquisition is always zero-timeout; false means skip this frame.
+extern "C" uint8_t gfx_acquire_framebuffer_shared_texture(int framebuffer, uint64_t key);
+extern "C" uint8_t gfx_release_framebuffer_shared_texture(int framebuffer, uint64_t key);
+extern "C" void gfx_disable_framebuffer_shared_texture(int framebuffer);
